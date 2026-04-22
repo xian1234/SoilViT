@@ -1,91 +1,211 @@
+"""
+SoilViT training script.
+
+All hyperparameters are read from a YAML config file (default:
+config/defaults.yaml).  Any value can be overridden on the command line:
+
+    python train.py --config config/defaults.yaml \
+                    --training.epochs 100 \
+                    --optimizer.lr 5e-4
+
+Usage
+-----
+    python train.py                          # use defaults
+    python train.py --config my_config.yaml  # custom config
+"""
+
+import argparse
+import copy
+import os
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from LandVit import SoilViT, GeoDataset, CombinedLoss, SpectralConsistencyLoss
+import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from LandVit import GeoDataset, SoilViT, SpectralConsistencyLoss
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def deep_set(cfg: dict, dotted_key: str, value: str):
+    """Set cfg[a][b][c] from dotted key 'a.b.c', auto-casting the value."""
+    keys = dotted_key.split(".")
+    node = cfg
+    for k in keys[:-1]:
+        node = node[k]
+    leaf = keys[-1]
+    orig = node.get(leaf)
+    # cast to original type when possible
+    if orig is None or isinstance(orig, str):
+        node[leaf] = value
+    elif isinstance(orig, bool):
+        node[leaf] = value.lower() in ("1", "true", "yes")
+    elif isinstance(orig, int):
+        node[leaf] = int(value)
+    elif isinstance(orig, float):
+        node[leaf] = float(value)
+    elif isinstance(orig, list):
+        node[leaf] = yaml.safe_load(value)
+    else:
+        node[leaf] = value
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", default="config/defaults.yaml",
+                   help="Path to YAML config file")
+    p.add_argument("overrides", nargs="*",
+                   help="key=value pairs to override config, e.g. optimizer.lr=1e-3")
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+
 class WeightedL1Loss(nn.Module):
-    def __init__(self, device):
-        super(WeightedL1Loss, self).__init__()
-        std_values = [0.09907163707875082, 0.021866454094841583,0.0822928954774687, 0.04990219943453045, 0.039165479266202265, 0.062032485604882254]
-        self.weights = 1.0 / (torch.tensor(std_values) + 1e-8)
+    def __init__(self, std_values: list, device: torch.device):
+        super().__init__()
+        weights = 1.0 / (torch.tensor(std_values, dtype=torch.float32) + 1e-8)
+        weights = weights / weights.sum()
+        self.register_buffer("weights", weights.to(device))
 
-        self.weights = self.weights / self.weights.sum()
-        self.weights = self.weights.to(device)
-    def forward(self, y_pred, y_true):
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         l1 = torch.abs(y_pred - y_true)
-
-        weighted_l1 = l1 * self.weights.view(1, -1, 1, 1)
-        return weighted_l1.mean()
+        return (l1 * self.weights.view(1, -1, 1, 1)).mean()
 
 
-# Structured training loop
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
+
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, device, pretained_weights=None):
+    def __init__(self, model, train_loader, val_loader, cfg: dict,
+                 device: torch.device, pretrained_weights=None):
         self.model = model.to(device)
-        if pretained_weights:
-            self.model.load_state_dict(pretained_weights, strict=False)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.device = device
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=50)
-        self.criterion = WeightedL1Loss(self.device).to(self.device) # nn.L1Loss()
-        # self.criterion = CombinedLoss(
-        #     mse_weight=0.8,
-        #     ssim_weight=0.1,
-        #     r2_weight=0.1,
-        #     channel_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  # 根据通道重要性设置权重
-        # )
-        self.spectral_loss = SpectralConsistencyLoss()
-        self.val_loss = nn.L1Loss()
-        self.best_eval_loss = float('inf')
+        if pretrained_weights is not None:
+            self.model.load_state_dict(pretrained_weights, strict=False)
 
-    def train_epoch(self):
+        self.train_loader = train_loader
+        self.val_loader   = val_loader
+        self.device       = device
+        self.save_path    = cfg["training"]["save_path"]
+
+        opt_cfg  = cfg["optimizer"]
+        sch_cfg  = cfg["scheduler"]
+        loss_cfg = cfg["loss"]
+
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=opt_cfg["lr"],
+            weight_decay=opt_cfg["weight_decay"],
+        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=sch_cfg["T_max"]
+        )
+        self.criterion  = WeightedL1Loss(loss_cfg["weighted_l1_stds"], device)
+        self.val_loss   = nn.L1Loss()
+        self.best_val   = float("inf")
+
+    def train_epoch(self) -> float:
         self.model.train()
-        total_loss = 0
-        for x, y, lat_lon in tqdm(self.train_loader):
+        total = 0.0
+        for x, y, lat_lon in tqdm(self.train_loader, leave=False):
             x, y, lat_lon = x.to(self.device), y.to(self.device), lat_lon.to(self.device)
             self.optimizer.zero_grad()
-            pred = self.model(x, lat_lon)
-            loss_recon = self.criterion(pred, y)
-            # loss_spec = self.spectral_loss(pred)
-            loss = loss_recon # + 0.01 * loss_spec  # weight spectral consistency
+            loss = self.criterion(self.model(x, lat_lon), y)
             loss.backward()
             self.optimizer.step()
-            total_loss += loss.item()
+            total += loss.item()
         self.scheduler.step()
-        return total_loss / len(self.train_loader)
+        return total / len(self.train_loader)
 
-    def validate(self):
+    def validate(self) -> float:
         self.model.eval()
-        total_loss = 0
+        total = 0.0
         with torch.no_grad():
             for x, y, lat_lon in self.val_loader:
                 x, y, lat_lon = x.to(self.device), y.to(self.device), lat_lon.to(self.device)
-                pred = self.model(x, lat_lon)
-                loss_recon = self.val_loss(pred, y)
-                # loss_spec = self.spectral_loss(pred)
-                loss = loss_recon # + 0.01 * loss_spec
-                total_loss += loss.item()
-        if total_loss < self.best_eval_loss:
-            self.best_eval_loss = total_loss
-            torch.save(self.model.state_dict(), 'model.pth')
-        return total_loss / len(self.val_loader)
+                total += self.val_loss(self.model(x, lat_lon), y).item()
+        avg = total / len(self.val_loader)
+        if avg < self.best_val:
+            self.best_val = avg
+            torch.save(self.model.state_dict(), self.save_path)
+        return avg
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+    cfg  = load_config(args.config)
+
+    for override in args.overrides:
+        if "=" not in override:
+            raise ValueError(f"Override must be key=value, got: {override!r}")
+        k, v = override.split("=", 1)
+        deep_set(cfg, k, v)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    print(f"Config: {args.config}")
+
+    mcfg = cfg["model"]
+    dcfg = cfg["data"]
+    tcfg = cfg["training"]
+
+    model = SoilViT(
+        img_size=mcfg["img_size"],
+        patch_size=mcfg["patch_size"],
+        in_chans=mcfg["in_chans"],
+        out_chans=mcfg["out_chans"],
+        embed_dim=mcfg["embed_dim"],
+        depth=mcfg["depth"],
+        num_heads=mcfg["num_heads"],
+        dropout=mcfg["dropout"],
+        geo_max_value=mcfg["geo_max_value"],
+    )
+
+    pretrained = None
+    if tcfg["pretrained_weights"]:
+        pretrained = torch.load(tcfg["pretrained_weights"], map_location=device)
+
+    train_loader = DataLoader(
+        GeoDataset(dcfg["train_json"], output_band_indices=dcfg["output_band_indices"]),
+        batch_size=tcfg["batch_size"],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        GeoDataset(dcfg["val_json"], output_band_indices=dcfg["output_band_indices"]),
+        batch_size=tcfg["val_batch_size"],
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    trainer = Trainer(model, train_loader, val_loader, cfg, device, pretrained)
+
+    for epoch in range(1, tcfg["epochs"] + 1):
+        train_loss = trainer.train_epoch()
+        val_loss   = trainer.validate()
+        print(f"Epoch {epoch:3d}/{tcfg['epochs']}  "
+              f"train={train_loss:.4f}  val={val_loss:.4f}  "
+              f"best={trainer.best_val:.4f}")
 
 
 if __name__ == "__main__":
-    # Example usage
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SoilViT(in_chans=13, out_chans=6, embed_dim=768, depth=12, num_heads=12)  
-    best_model = 'best_model_00402.pth'  # Path to save the best model weights
-    pretained_weights = None #torch.load(best_model)
-    train_loader = DataLoader(GeoDataset('train_patch_data.json'), batch_size=16, shuffle=True)
-    val_loader = DataLoader(GeoDataset('eval_patch_data.json'), batch_size=1, shuffle=False)  # Define your validation DataLoader
-
-    trainer = Trainer(model, train_loader, val_loader, device, pretained_weights)
-    for epoch in range(50):  # Replace with your desired number of epochs
-        train_loss = trainer.train_epoch()
-        val_loss = trainer.validate()
-        print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+    main()
